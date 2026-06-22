@@ -4,11 +4,30 @@
 #include <HTTPClient.h>
 #include <Audio.h>
 #include <ArduinoJson.h>
+#include <Wire.h>
+#include <ESP_I2S.h>
+#include "es8311.h"
 
-// --- HARDWARE CONFIGURATION (ES3C28P 2.8") ---
-#define I2S_DOUT      GPIO_NUM_1  
-#define I2S_BCLK      GPIO_NUM_2  
-#define I2S_LRCK      GPIO_NUM_4  
+// --- HARDWARE CONFIGURATION (Freenove FNK0104AB-compatible 2.8" ILI9341) ---
+#define TFT_MOSI      11
+#define TFT_MISO      13
+#define TFT_SCLK      12
+#define TFT_DC        46
+#define TFT_CS        10
+#define TFT_BL        45
+
+#define TOUCH_SDA     16
+#define TOUCH_SCL     15
+#define TOUCH_INT     17
+#define TOUCH_RST     18
+
+#define I2S_MCLK      GPIO_NUM_4
+#define I2S_BCLK      GPIO_NUM_5
+#define I2S_DIN       GPIO_NUM_6
+#define I2S_LRCK      GPIO_NUM_7
+#define I2S_DOUT      GPIO_NUM_8
+#define AUDIO_AMP_EN  GPIO_NUM_1
+#define AUDIO_I2C_HZ  400000
 
 #define MAX_STATIONS 20
 
@@ -34,19 +53,19 @@ public:
       cfg.spi_host = SPI2_HOST;
       cfg.spi_mode = 0;
       cfg.freq_write = 40000000;
-      cfg.pin_mosi = 11; cfg.pin_miso = 13; cfg.pin_sclk = 12; cfg.pin_dc = 46;
+      cfg.pin_mosi = TFT_MOSI; cfg.pin_miso = TFT_MISO; cfg.pin_sclk = TFT_SCLK; cfg.pin_dc = TFT_DC;
       _bus_instance.config(cfg);
       _panel_instance.setBus(&_bus_instance);
     }
     {
       auto cfg = _panel_instance.config();
-      cfg.pin_cs = 10; cfg.pin_rst = -1;
+      cfg.pin_cs = TFT_CS; cfg.pin_rst = -1;
       cfg.panel_width = 240; cfg.panel_height = 320;
       _panel_instance.config(cfg);
     }
     {
       auto cfg = _light_instance.config();
-      cfg.pin_bl = 45;                  
+      cfg.pin_bl = TFT_BL;
       cfg.freq = 44100;
       cfg.pwm_channel = 7;
       _light_instance.config(cfg);
@@ -55,7 +74,7 @@ public:
     {
       auto cfg = _touch_instance.config();
       cfg.x_min = 0; cfg.x_max = 239; cfg.y_min = 0; cfg.y_max = 319;
-      cfg.pin_sda = 16; cfg.pin_scl = 15; cfg.pin_int = 17; cfg.pin_rst = 18;
+      cfg.pin_sda = TOUCH_SDA; cfg.pin_scl = TOUCH_SCL; cfg.pin_int = TOUCH_INT; cfg.pin_rst = TOUCH_RST;
       cfg.i2c_port = 0; 
       cfg.freq = 400000; 
       _touch_instance.config(cfg);
@@ -67,9 +86,11 @@ public:
 
 static LGFX lcd;
 Audio audio;
+I2SClass es8311I2S;
 
 String currentTrack = "Connecting...";
 bool isPlaying = true;
+bool audioHardwareReady = false;
 
 // Network Profiles
 const char* ssid = "simson";
@@ -84,6 +105,7 @@ const unsigned long debounceDelay = 400;
 void loadPlaylistFromGitHub();
 void drawBaseUI();
 void updateDisplayStrings();
+bool initAudioHardware();
 
 void setup() {
   Serial.begin(115200);
@@ -121,10 +143,16 @@ void setup() {
   }
   updateDisplayStrings();
 
-  audio.setPinout(I2S_BCLK, I2S_LRCK, I2S_DOUT);
+  audioHardwareReady = initAudioHardware();
+  if (!audioHardwareReady) {
+    currentTrack = "Audio codec init failed";
+    updateDisplayStrings();
+  }
+
+  audio.setPinout(I2S_BCLK, I2S_LRCK, I2S_DOUT, I2S_MCLK);
   audio.setVolume(12); 
   
-  if (totalStations > 0) {
+  if (audioHardwareReady && totalStations > 0) {
     audio.connecttohost(playlist[currentStationIdx].url.c_str());
   }
 }
@@ -136,7 +164,7 @@ void loop() {
   if (lcd.getTouch(&touchX, &touchY)) {
     if ((millis() - lastDebounceTime) > debounceDelay) {
       if (touchY > 160 && touchY < 220 && touchX > 20 && touchX < 90) {
-        if (totalStations > 0) {
+        if (audioHardwareReady && totalStations > 0) {
           currentStationIdx = (currentStationIdx - 1 + totalStations) % totalStations;
           audio.connecttohost(playlist[currentStationIdx].url.c_str());
           currentTrack = "Loading stream...";
@@ -144,13 +172,13 @@ void loop() {
           lastDebounceTime = millis();
         }
       }
-      else if (touchY > 160 && touchY < 220 && touchX > 120 && touchX < 190) {
+      else if (touchY > 160 && touchY < 220 && touchX > 120 && touchX < 190 && audioHardwareReady) {
         isPlaying = !isPlaying;
         audio.pauseResume(); 
         lastDebounceTime = millis();
       }
       else if (touchY > 160 && touchY < 220 && touchX > 220 && touchX < 290) {
-        if (totalStations > 0) {
+        if (audioHardwareReady && totalStations > 0) {
           currentStationIdx = (currentStationIdx + 1) % totalStations;
           audio.connecttohost(playlist[currentStationIdx].url.c_str());
           currentTrack = "Loading stream...";
@@ -196,6 +224,26 @@ void loadPlaylistFromGitHub() {
     Serial.printf("Failed to fetch JSON. HTTP Error Code: %d\n", httpCode);
   }
   http.end();
+}
+
+bool initAudioHardware() {
+  pinMode(AUDIO_AMP_EN, OUTPUT);
+  digitalWrite(AUDIO_AMP_EN, LOW);
+
+  Wire.begin(TOUCH_SDA, TOUCH_SCL, AUDIO_I2C_HZ);
+
+  es8311I2S.setPins(I2S_BCLK, I2S_LRCK, I2S_DOUT, I2S_DIN, I2S_MCLK);
+  if (!es8311I2S.begin(I2S_MODE_STD, 44100, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO, I2S_STD_SLOT_LEFT)) {
+    Serial.println("Failed to initialize ES8311 I2S bus.");
+    return false;
+  }
+
+  if (es8311_codec_init() != ESP_OK) {
+    Serial.println("ES8311 codec init failed.");
+    return false;
+  }
+
+  return true;
 }
 
 void drawBaseUI() {
