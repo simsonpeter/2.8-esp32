@@ -28,6 +28,7 @@
 #define I2S_DOUT      GPIO_NUM_8
 #define AUDIO_AMP_EN  GPIO_NUM_1
 #define AUDIO_I2C_HZ  400000
+#define BAT_ADC_PIN   9
 
 #define MAX_STATIONS 20
 
@@ -91,6 +92,8 @@ I2SClass es8311I2S;
 String currentTrack = "Connecting...";
 bool isPlaying = true;
 bool audioHardwareReady = false;
+float batteryVoltage = 0.0;
+int batteryPercent = 0;
 
 // Network Profiles
 const char* ssid = "simson";
@@ -106,9 +109,14 @@ void loadPlaylistFromGitHub();
 void drawBaseUI();
 void updateDisplayStrings();
 bool initAudioHardware();
+void updateBatteryReading();
+void drawBatteryMeter();
+void drawStationCounter();
 
 void setup() {
   Serial.begin(115200);
+  pinMode(BAT_ADC_PIN, INPUT);
+  updateBatteryReading();
   
   lcd.init();
   lcd.setRotation(1); 
@@ -194,6 +202,13 @@ void loop() {
     lastUIUpdate = millis();
     updateDisplayStrings();
   }
+
+  static unsigned long lastBatteryUpdate = 0;
+  if (millis() - lastBatteryUpdate > 5000) {
+    lastBatteryUpdate = millis();
+    updateBatteryReading();
+    drawBatteryMeter();
+  }
 }
 
 void loadPlaylistFromGitHub() {
@@ -246,12 +261,37 @@ bool initAudioHardware() {
   return true;
 }
 
+void updateBatteryReading() {
+  batteryVoltage = analogReadMilliVolts(BAT_ADC_PIN) * 2.0 / 1000.0;
+  batteryPercent = (int)((batteryVoltage - 3.3) * 100.0 / (4.2 - 3.3));
+  batteryPercent = constrain(batteryPercent, 0, 100);
+}
+
+void drawBatteryMeter() {
+  uint16_t headerColor = lgfx::color565(30, 30, 30);
+  uint16_t fillColor = batteryPercent > 25 ? lgfx::color565(0, 190, 90) : TFT_RED;
+  int barWidth = map(batteryPercent, 0, 100, 0, 46);
+
+  lcd.fillRect(220, 4, 95, 36, headerColor);
+  lcd.setTextColor(TFT_WHITE, headerColor);
+  lcd.setTextSize(1);
+  lcd.drawString(String(batteryVoltage, 1) + "V", 238, 5);
+  lcd.drawRect(238, 21, 50, 12, TFT_WHITE);
+  lcd.fillRect(288, 24, 3, 6, TFT_WHITE);
+  lcd.fillRect(240, 23, 46, 8, lgfx::color565(55, 55, 55));
+  if (barWidth > 0) {
+    lcd.fillRect(240, 23, barWidth, 8, fillColor);
+  }
+  lcd.drawString(String(batteryPercent) + "%", 292, 22);
+}
+
 void drawBaseUI() {
   lcd.fillScreen(TFT_BLACK);
   lcd.fillRect(0, 0, 320, 45, lgfx::color565(30, 30, 30));
   lcd.setTextColor(TFT_GOLD);
   lcd.setTextSize(1.5);
-  lcd.drawString("TC RADIOS | Personal Dashboard", 15, 15);
+  lcd.drawString("TC RADIOS", 15, 15);
+  drawBatteryMeter();
   
   lcd.fillRect(20, 170, 70, 45, lgfx::color565(0, 100, 200));  
   lcd.fillRect(125, 170, 70, 45, lgfx::color565(0, 180, 80)); 
@@ -264,20 +304,36 @@ void drawBaseUI() {
   lcd.drawString("NEXT", 250, 185);
 }
 
+void drawStationCounter() {
+  lcd.fillRect(15, 88, 290, 18, TFT_BLACK);
+  lcd.setTextColor(TFT_GREEN);
+  lcd.setTextSize(1.5);
+
+  if (totalStations > 0) {
+    lcd.drawString(String("Station ") + String(currentStationIdx + 1) + " of " + String(totalStations), 15, 88);
+  } else {
+    lcd.drawString("Station 0 of 0", 15, 88);
+  }
+}
+
 void updateDisplayStrings() {
-  lcd.fillRect(10, 60, 300, 30, TFT_BLACK);
+  drawBatteryMeter();
+
+  lcd.fillRect(10, 55, 300, 30, TFT_BLACK);
   lcd.setTextColor(TFT_CYAN);
   lcd.setTextSize(2);
   if (totalStations > 0) {
-    lcd.drawString(playlist[currentStationIdx].name.substring(0, 24), 15, 60);
+    lcd.drawString(playlist[currentStationIdx].name.substring(0, 24), 15, 58);
   } else {
-    lcd.drawString("No Stations Loaded", 15, 60);
+    lcd.drawString("No Stations Loaded", 15, 58);
   }
 
-  lcd.fillRect(10, 100, 300, 50, TFT_BLACK);
+  drawStationCounter();
+
+  lcd.fillRect(10, 112, 300, 42, TFT_BLACK);
   lcd.setTextColor(TFT_WHITE);
   lcd.setTextSize(1.5);
-  lcd.drawString(currentTrack.substring(0, 35), 15, 105);
+  lcd.drawString(currentTrack.substring(0, 35), 15, 115);
 }
 
 void audio_showstreamtitle(const char *info){
