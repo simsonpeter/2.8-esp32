@@ -6,6 +6,7 @@
 #include <ArduinoJson.h>
 #include <Wire.h>
 #include <ESP_I2S.h>
+#include <Preferences.h>
 #include "es8311.h"
 
 // --- HARDWARE CONFIGURATION (Freenove FNK0104AB-compatible 2.8" ILI9341) ---
@@ -39,6 +40,7 @@ struct RadioStation {
 RadioStation playlist[MAX_STATIONS];
 int totalStations = 0;
 int currentStationIdx = 0;
+Preferences preferences;
 
 // --- DISPLAY SETUP ---
 class LGFX : public lgfx::LGFX_Device {
@@ -106,6 +108,8 @@ void loadPlaylistFromGitHub();
 void drawBaseUI();
 void updateDisplayStrings();
 bool initAudioHardware();
+void saveLastPlayedStation();
+void loadLastPlayedStation();
 
 void setup() {
   Serial.begin(115200);
@@ -135,6 +139,7 @@ void setup() {
   }
   
   loadPlaylistFromGitHub();
+  loadLastPlayedStation();
 
   if (totalStations > 0) {
     currentTrack = "Connecting to audio stream...";
@@ -152,6 +157,7 @@ void setup() {
   audio.setPinout(I2S_BCLK, I2S_LRCK, I2S_DOUT, I2S_MCLK);
   audio.setVolume(12); 
   
+  // Always resume the last played radio station on start
   if (audioHardwareReady && totalStations > 0) {
     audio.connecttohost(playlist[currentStationIdx].url.c_str());
   }
@@ -166,6 +172,7 @@ void loop() {
       if (touchY > 160 && touchY < 220 && touchX > 20 && touchX < 90) {
         if (audioHardwareReady && totalStations > 0) {
           currentStationIdx = (currentStationIdx - 1 + totalStations) % totalStations;
+          saveLastPlayedStation();
           audio.connecttohost(playlist[currentStationIdx].url.c_str());
           currentTrack = "Loading stream...";
           updateDisplayStrings();
@@ -180,6 +187,7 @@ void loop() {
       else if (touchY > 160 && touchY < 220 && touchX > 220 && touchX < 290) {
         if (audioHardwareReady && totalStations > 0) {
           currentStationIdx = (currentStationIdx + 1) % totalStations;
+          saveLastPlayedStation();
           audio.connecttohost(playlist[currentStationIdx].url.c_str());
           currentTrack = "Loading stream...";
           updateDisplayStrings();
@@ -224,6 +232,55 @@ void loadPlaylistFromGitHub() {
     Serial.printf("Failed to fetch JSON. HTTP Error Code: %d\n", httpCode);
   }
   http.end();
+}
+
+void saveLastPlayedStation() {
+  if (totalStations <= 0 || currentStationIdx < 0 || currentStationIdx >= totalStations) {
+    return;
+  }
+  if (!preferences.begin("radio", false)) {
+    Serial.println("Failed to open preferences for writing.");
+    return;
+  }
+  preferences.putInt("lastIdx", currentStationIdx);
+  preferences.putString("lastUrl", playlist[currentStationIdx].url);
+  preferences.end();
+  Serial.printf("Saved last played station idx=%d\n", currentStationIdx);
+}
+
+void loadLastPlayedStation() {
+  if (totalStations <= 0) {
+    currentStationIdx = 0;
+    return;
+  }
+
+  if (!preferences.begin("radio", true)) {
+    Serial.println("No saved last station; starting at index 0.");
+    currentStationIdx = 0;
+    return;
+  }
+
+  String lastUrl = preferences.getString("lastUrl", "");
+  int lastIdx = preferences.getInt("lastIdx", 0);
+  preferences.end();
+
+  // Prefer matching by URL so playlist reordering still resumes the same station
+  if (lastUrl.length() > 0) {
+    for (int i = 0; i < totalStations; i++) {
+      if (playlist[i].url == lastUrl) {
+        currentStationIdx = i;
+        Serial.printf("Restored last played station by URL idx=%d\n", currentStationIdx);
+        return;
+      }
+    }
+  }
+
+  if (lastIdx >= 0 && lastIdx < totalStations) {
+    currentStationIdx = lastIdx;
+  } else {
+    currentStationIdx = 0;
+  }
+  Serial.printf("Restored last played station idx=%d\n", currentStationIdx);
 }
 
 bool initAudioHardware() {
