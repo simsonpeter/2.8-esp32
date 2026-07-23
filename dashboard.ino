@@ -1,5 +1,7 @@
 /*
- * TC Radios — ES3C28P 2.8" ESP32-S3 (320x240 landscape)
+ * TC Chat — Free AI chatbot for ES3C28P 2.8" ESP32-S3 (320x240 landscape)
+ * Default: anonymous Pollinations text API (no key).
+ * Optional: free Groq key (console.groq.com) for faster/reliable replies.
  * Open as: Documents/Arduino/dashboard/dashboard.ino
  */
 
@@ -7,44 +9,25 @@
 #include <LovyanGFX.hpp>
 #include <WiFi.h>
 #include <HTTPClient.h>
-#include <Audio.h>
+#include <WiFiClientSecure.h>
 #include <Wire.h>
-#include <LittleFS.h>
 #include <Preferences.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
-#define I2S_AMP_EN    GPIO_NUM_1
-#define I2S_MCLK      GPIO_NUM_4
-#define I2S_BCLK      GPIO_NUM_5
-#define I2S_DOUT      GPIO_NUM_8
-#define I2S_DIN       GPIO_NUM_6
-#define I2S_LRCK      GPIO_NUM_7
 #define I2C_SDA       16
 #define I2C_SCL       15
-#define ES8311_ADDR   0x18
-
 #define SCR_W         320
 #define SCR_H         240
 #define TOUCH_RST     18
 #define TOUCH_INT     17
 #define TOUCH_ADDR    0x38
-#define MAX_STATIONS  50
 #define WIFI_TIMEOUT_MS 30000
-#define NAME_LEN      28
-#define GENRE_LEN     22
-#define URL_LEN       512
-#define STREAM_SKIP_MS 12000
-#define SPLASH_MS     5000
-#define CACHE_PATH    "/stations.json"
+#define SPLASH_MS     2500
 #define MAX_WIFI_NETS 16
 #define WIFI_SSID_LEN 33
 #define WIFI_PASS_LEN 64
-#define WIFI_BTN_X0   252
-#define WIFI_BTN_X1   302
-#define WIFI_BTN_Y0   10
-#define WIFI_BTN_Y1   30
 #define WIFI_LIST_Y0  52
 #define WIFI_ROW_H    28
 #define WIFI_VISIBLE  4
@@ -54,51 +37,32 @@
 #define BAT_UPDATE_MS 2000
 #define BAT_ANIM_MS   450
 #define BAT_ICON_X    14
-#define BAT_ICON_Y    14
+#define BAT_ICON_Y    10
 #define BAT_ICON_W    36
 #define BAT_ICON_H    18
 #define BAT_HISTORY   8
 #define BAT_NO_BAT_V  4.30f
 
-#define TILE_X        18
-#define TILE_Y        34
-#define TILE_SIZE     72
+#define MAX_MSGS      8
+#define MSG_LEN       180
+#define DRAFT_LEN     96
+#define PROMPT_BUF    1400
+#define REPLY_BUF     512
+#define API_KEY_LEN   128
+#define AI_URL_BASE   "https://text.pollinations.ai/"
+#define GROQ_URL      "https://api.groq.com/openai/v1/chat/completions"
+#define GROQ_MODEL    "llama-3.1-8b-instant"
 
-// Dock layout — volume row on top, transport row centered below with equal spacing
-#define DOCK_Y        148
-#define DOCK_H        86
-#define VOL_Y         156
-#define VOL_ROW_Y0    152
-#define VOL_ROW_Y1    178
-#define VOL_MINUS_X0  12
-#define VOL_MINUS_X1  42
-#define VOL_PLUS_X0   278
-#define VOL_PLUS_X1   308
-#define VOL_BAR_X0    48
-#define VOL_BAR_X1    272
-#define TRN_ROW_Y0    182
-#define TRN_ROW_Y1    230
-#define TRN_CY        204
-#define BTN_PREV_CX   70
-#define BTN_PLAY_CX   160
-#define BTN_NEXT_CX   250
-#define BTN_HIT_W     36
-#define BTN_PREV_X0   (BTN_PREV_CX - BTN_HIT_W)
-#define BTN_PREV_X1   (BTN_PREV_CX + BTN_HIT_W)
-#define BTN_PLAY_X0   (BTN_PLAY_CX - BTN_HIT_W)
-#define BTN_PLAY_X1   (BTN_PLAY_CX + BTN_HIT_W)
-#define BTN_NEXT_X0   (BTN_NEXT_CX - BTN_HIT_W)
-#define BTN_NEXT_X1   (BTN_NEXT_CX + BTN_HIT_W)
-
-struct RadioStation {
-  char name[NAME_LEN];
-  char url[URL_LEN];
-  char genre[GENRE_LEN];
-};
-
-RadioStation playlist[MAX_STATIONS];
-int totalStations = 0;
-int currentStationIdx = 0;
+// Chat chrome
+#define HEADER_H      30
+#define STATUS_H      18
+#define INPUT_H       28
+#define MSG_AREA_Y0   (HEADER_H + 4)
+#define MSG_AREA_Y1_KB 98
+#define MSG_AREA_Y1_FULL (SCR_H - INPUT_H - 8)
+#define INPUT_Y_KB    100
+#define INPUT_Y_FULL  (SCR_H - INPUT_H - 4)
+#define KB_Y0         130
 
 class LGFX : public lgfx::LGFX_Device {
   lgfx::Panel_ILI9341  _panel_instance;
@@ -135,7 +99,7 @@ public:
       cfg.dummy_read_pixel = 8;
       cfg.dummy_read_bits = 1;
       cfg.readable = true;
-      cfg.invert = true;   // TFT_INVERSION_ON — required on ES3C28P
+      cfg.invert = true;
       cfg.rgb_order = false;
       cfg.dlen_16bit = false;
       cfg.bus_shared = true;
@@ -155,37 +119,38 @@ public:
 };
 
 static LGFX lcd;
-Audio audio;
 
-char statusLine[40] = "Starting...";
-char streamTitle[40] = "";
-bool isPlaying = true;
-bool audioReady = false;
-bool streamPlaying = false;
-bool userPaused = false;
-bool bgDrawn = false;
-bool stationDirty = true;
-bool statusDirty = true;
-bool dockDirty = true;
-int volumeLevel = 12;
-unsigned long streamConnectMs = 0;
-unsigned long lastAutoSkipMs = 0;
-unsigned long lastDebounceTime = 0;
-const unsigned long debounceDelay = 200;
+struct ChatMsg {
+  bool fromUser;
+  char text[MSG_LEN];
+};
+
+ChatMsg messages[MAX_MSGS];
+int msgCount = 0;
+int msgScroll = 0;
+char draft[DRAFT_LEN] = "";
+char statusLine[48] = "Starting...";
+bool chatDirty = true;
+bool kbShift = false;
+bool aiBusy = false;
+volatile bool aiRequestPending = false;
+volatile bool aiReplyReady = false;
+char aiPendingPrompt[PROMPT_BUF];
+char aiReplyText[REPLY_BUF];
+char aiErrorText[64] = "";
 
 char wifiSsid[WIFI_SSID_LEN] = "simson";
 char wifiPass[WIFI_PASS_LEN] = "jayatha10";
-const char* jsonUrl = "https://raw.githubusercontent.com/simsonpeter/Tcradios/refs/heads/main/stations.json";
 
-enum BootState { BOOT_SPLASH, BOOT_WIFI, BOOT_PLAYLIST, BOOT_AUDIO, BOOT_DONE };
-enum UiMode { UI_RADIO, UI_WIFI, UI_WIFI_PASS };
+enum BootState { BOOT_SPLASH, BOOT_WIFI, BOOT_DONE };
+enum UiMode { UI_CHAT, UI_COMPOSE, UI_WIFI, UI_WIFI_PASS, UI_API_KEY };
 BootState bootState = BOOT_SPLASH;
-UiMode uiMode = UI_RADIO;
+UiMode uiMode = UI_CHAT;
+char groqApiKey[API_KEY_LEN] = "";
+char apiKeyDraft[API_KEY_LEN] = "";
+bool apiKbShift = false;
 unsigned long wifiStartMs = 0;
 unsigned long splashStartMs = 0;
-bool playlistLoadStarted = false;
-bool playlistRefreshPending = false;
-bool fsReady = false;
 Preferences wifiPrefs;
 bool wifiDirty = true;
 bool wifiScanning = false;
@@ -227,49 +192,38 @@ float batHistory[BAT_HISTORY];
 int batHistoryIdx = 0;
 int batHistoryCount = 0;
 
-SemaphoreHandle_t audioMutex = nullptr;
-TaskHandle_t stationTaskHandle = nullptr;
-volatile bool stationConnecting = false;
-volatile int connectGen = 0;
+unsigned long lastDebounceTime = 0;
+const unsigned long debounceDelay = 180;
+TaskHandle_t aiTaskHandle = nullptr;
+SemaphoreHandle_t aiMutex = nullptr;
 
 uint16_t C(uint8_t r, uint8_t g, uint8_t b) { return lcd.color565(r, g, b); }
 
 void drawBackground();
-void drawStationPanel();
-void drawPlayButtonOnly();
-void drawVolumeOnly();
-void setStatus(const char* msg);
-bool parsePlaylistJson(const char* json);
-bool loadPlaylistFromCache();
-bool loadPlaylistFromGitHub();
-void savePlaylistCache(const String& payload);
 void showSplashScreen();
-void drawStationTile();
-char stationInitial(int idx);
-void drawDock();
-void updateStatusArea();
-void connectCurrentStation();
-void skipToNextStation();
-void skipToPrevStation();
-void initAudioHardware();
 void showBootError(const char* line1, const char* line2);
-bool initES8311Codec();
-void setVolumeLevel(int v);
-void handleTouch(int32_t tx, int32_t ty);
+void setStatus(const char* msg);
 void initTouchController();
 bool readTouchScreen(int32_t &sx, int32_t &sy);
-void refreshPlaybackStatus();
-void drawIconPrev(int cx, int cy, uint16_t col);
-void drawIconNext(int cx, int cy, uint16_t col);
-void drawIconPlay(int cx, int cy, uint16_t col);
-void drawIconPause(int cx, int cy, uint16_t col);
-bool extractJsonField(const char* json, const char* field, char* dest, size_t destLen);
+void handleTouch(int32_t tx, int32_t ty);
+void initBatteryMonitor();
+void updateBatteryMonitor();
+float readBatteryVoltage();
+int batteryVoltageToPercent(float volts);
+void drawBatteryMeter(int x, int y);
+void drawBatteryBolt(int cx, int cy, uint16_t col);
 void loadWifiCredentials();
 void saveWifiCredentials();
-void loadVolumeSetting();
-void saveVolumeSetting();
+void loadApiKey();
+void saveApiKey();
 void openWifiTool();
 void closeWifiTool();
+void openApiKeyTool();
+void closeApiKeyTool();
+void drawApiKeyScreen();
+void handleApiKeyTouch(int32_t tx, int32_t ty);
+void appendApiKeyChar(char c);
+void backspaceApiKey();
 void startWifiScan();
 void pollWifiScan();
 void drawWifiScreen();
@@ -283,205 +237,54 @@ void appendWifiPassChar(char c);
 void backspaceWifiPass();
 void joinWifiWithPassword();
 bool wifiNeedsPassword(int idx);
-void initBatteryMonitor();
-void updateBatteryMonitor();
-float readBatteryVoltage();
-int batteryVoltageToPercent(float volts);
-void drawBatteryMeter(int x, int y);
-void drawBatteryMeterOnly();
-void drawBatteryBolt(int cx, int cy, uint16_t col);
-bool audioLock(TickType_t ticks = portMAX_DELAY);
-void audioUnlock();
-void stationConnectTask(void* param);
-void startStationConnectTask();
-
-bool es8311Write(uint8_t reg, uint8_t val) {
-  Wire.beginTransmission(ES8311_ADDR);
-  Wire.write(reg);
-  Wire.write(val);
-  return Wire.endTransmission() == 0;
-}
-
-bool initES8311Codec() {
-  if (!es8311Write(0x00, 0x1F)) return false;
-  delay(20);
-  if (!es8311Write(0x00, 0x00)) return false;
-  if (!es8311Write(0x00, 0x80)) return false;
-  if (!es8311Write(0x01, 0x3F)) return false;
-  if (!es8311Write(0x02, 0x00)) return false;
-  if (!es8311Write(0x03, 0x10)) return false;
-  if (!es8311Write(0x04, 0x10)) return false;
-  if (!es8311Write(0x05, 0x00)) return false;
-  if (!es8311Write(0x06, 0x03)) return false;
-  if (!es8311Write(0x07, 0x00)) return false;
-  if (!es8311Write(0x08, 0xFF)) return false;
-  if (!es8311Write(0x09, 0x0C)) return false;
-  if (!es8311Write(0x0A, 0x0C)) return false;
-  if (!es8311Write(0x0D, 0x01)) return false;
-  if (!es8311Write(0x0E, 0x02)) return false;
-  if (!es8311Write(0x12, 0x00)) return false;
-  if (!es8311Write(0x13, 0x10)) return false;
-  if (!es8311Write(0x1C, 0x6A)) return false;
-  if (!es8311Write(0x37, 0x08)) return false;
-  if (!es8311Write(0x14, 0x1A)) return false;
-  if (!es8311Write(0x31, 0x00)) return false;
-  if (!es8311Write(0x32, 0xD8)) return false;
-  return true;
-}
-
-void setVolumeLevel(int v) {
-  if (v < 0) v = 0;
-  if (v > 21) v = 21;
-  bool changed = (v != volumeLevel);
-  volumeLevel = v;
-  // Codec volume always applies immediately, even while a stream is connecting.
-  uint8_t reg = (v == 0) ? 0 : (uint8_t)((v * 255) / 21);
-  es8311Write(0x32, reg);
-  if (audioReady && audioLock(0)) {
-    audio.setVolume(volumeLevel);
-    audioUnlock();
-  }
-  if (changed) saveVolumeSetting();
-}
-
-bool extractJsonField(const char* json, const char* field, char* dest, size_t destLen) {
-  char key[24];
-  snprintf(key, sizeof(key), "\"%s\"", field);
-  const char* pos = strstr(json, key);
-  if (!pos) return false;
-  pos += strlen(key);
-  while (*pos == ' ' || *pos == '\t' || *pos == ':') pos++;
-  if (*pos != '"') return false;
-  pos++;
-  size_t i = 0;
-  while (*pos && *pos != '"' && i < destLen - 1) {
-    if (*pos == '\\' && pos[1]) pos++;
-    dest[i++] = *pos++;
-  }
-  dest[i] = '\0';
-  return i > 0;
-}
-
-bool parsePlaylistJson(const char* json) {
-  if (!json || !json[0]) return false;
-  totalStations = 0;
-  const char* cursor = json;
-  while (totalStations < MAX_STATIONS) {
-    const char* obj = strstr(cursor, "\"name\"");
-    if (!obj) break;
-    char name[NAME_LEN], url[URL_LEN], genre[GENRE_LEN];
-    if (!extractJsonField(obj, "name", name, sizeof(name))) break;
-    if (!extractJsonField(obj, "url", url, sizeof(url)) || strlen(url) == 0) {
-      cursor = obj + 6;
-      continue;
-    }
-    extractJsonField(obj, "genre", genre, sizeof(genre));
-    strncpy(playlist[totalStations].name, name, NAME_LEN - 1);
-    playlist[totalStations].name[NAME_LEN - 1] = '\0';
-    strncpy(playlist[totalStations].url, url, URL_LEN - 1);
-    playlist[totalStations].url[URL_LEN - 1] = '\0';
-    strncpy(playlist[totalStations].genre, genre, GENRE_LEN - 1);
-    playlist[totalStations].genre[GENRE_LEN - 1] = '\0';
-    totalStations++;
-    const char* nextUrl = strstr(obj, "\"url\"");
-    cursor = nextUrl ? nextUrl + 5 : obj + 6;
-  }
-  return totalStations > 0;
-}
-
-bool loadPlaylistFromCache() {
-  if (!fsReady || !LittleFS.exists(CACHE_PATH)) return false;
-  File f = LittleFS.open(CACHE_PATH, "r");
-  if (!f) return false;
-  String payload = f.readString();
-  f.close();
-  return parsePlaylistJson(payload.c_str());
-}
-
-void savePlaylistCache(const String& payload) {
-  if (!fsReady || payload.length() < 32) return;
-  File f = LittleFS.open(CACHE_PATH, "w");
-  if (!f) return;
-  f.print(payload);
-  f.close();
-}
+void drawChatScreen();
+void drawComposeKeyboard();
+void drawHeader();
+void drawMessageArea();
+void drawInputBar(bool composing);
+void handleChatTouch(int32_t tx, int32_t ty);
+void handleComposeTouch(int32_t tx, int32_t ty);
+void appendDraftChar(char c);
+void backspaceDraft();
+void clearDraft();
+void addMessage(bool fromUser, const char* text);
+void sendDraftMessage();
+void buildAiPrompt(char* out, size_t outLen);
+void urlEncode(const char* src, char* dest, size_t destLen);
+bool extractJsonContent(const char* json, char* dest, size_t destLen);
+bool callGroqAi(const char* prompt, char* reply, size_t replyLen, char* err, size_t errLen);
+bool callPollinationsAi(const char* prompt, char* reply, size_t replyLen, char* err, size_t errLen);
+bool callFreeAi(const char* prompt, char* reply, size_t replyLen, char* err, size_t errLen);
+void aiWorkerTask(void* param);
+void startAiTask();
+void requestAiReply();
+void applyAiReply();
+void wrapDrawText(const char* text, int x, int y, int maxW, int maxLines, uint16_t color);
 
 void showSplashScreen() {
   lcd.fillScreen(TFT_WHITE);
   lcd.setTextColor(C(108, 92, 231));
   lcd.setTextSize(3);
-  const char* title = "TC RADIOS";
+  const char* title = "TC CHAT";
   int tw = lcd.textWidth(title);
-  lcd.drawString(title, (SCR_W - tw) / 2, (SCR_H - 28) / 2);
+  lcd.drawString(title, (SCR_W - tw) / 2, 88);
+  lcd.setTextSize(1);
+  lcd.setTextColor(C(120, 120, 140));
+  const char* sub = "Free AI chatbot";
+  tw = lcd.textWidth(sub);
+  lcd.drawString(sub, (SCR_W - tw) / 2, 130);
 }
 
-char stationInitial(int idx) {
-  if (idx < 0 || idx >= totalStations) return '?';
-  const char* p = playlist[idx].name;
-  while (*p && !isalnum((unsigned char)*p)) p++;
-  char c = *p ? *p : '?';
-  if (c >= 'a' && c <= 'z') c -= 32;
-  return c;
-}
-
-void drawStationTile() {
-  lcd.fillRoundRect(TILE_X - 3, TILE_Y - 3, TILE_SIZE + 6, TILE_SIZE + 6, 16, C(255, 255, 255));
-  if (totalStations <= 0) return;
-  uint16_t colors[] = { C(108, 92, 231), C(0, 184, 148), C(253, 121, 168), C(253, 150, 68) };
-  uint16_t bg = colors[currentStationIdx % 4];
-  lcd.fillRoundRect(TILE_X, TILE_Y, TILE_SIZE, TILE_SIZE, 14, bg);
-  char letter[2] = { stationInitial(currentStationIdx), '\0' };
-  lcd.setTextColor(TFT_WHITE);
-  lcd.setTextSize(3);
-  int tw = lcd.textWidth(letter);
-  lcd.drawString(letter, TILE_X + (TILE_SIZE - tw) / 2, TILE_Y + 22);
-}
-
-void drawIconPrev(int cx, int cy, uint16_t col) {
-  lcd.fillTriangle(cx - 14, cy, cx - 2, cy - 10, cx - 2, cy + 10, col);
-  lcd.fillTriangle(cx - 4, cy, cx + 8, cy - 10, cx + 8, cy + 10, col);
-}
-
-void drawIconNext(int cx, int cy, uint16_t col) {
-  lcd.fillTriangle(cx + 14, cy, cx + 2, cy - 10, cx + 2, cy + 10, col);
-  lcd.fillTriangle(cx + 4, cy, cx - 8, cy - 10, cx - 8, cy + 10, col);
-}
-
-void drawIconPlay(int cx, int cy, uint16_t col) {
-  (void)col;
-  lcd.fillCircle(cx, cy, 22, C(255, 118, 117));
-  lcd.fillTriangle(cx - 5, cy - 10, cx - 5, cy + 10, cx + 12, cy, TFT_WHITE);
-}
-
-void drawIconPause(int cx, int cy, uint16_t col) {
-  (void)col;
-  lcd.fillCircle(cx, cy, 22, C(255, 118, 117));
-  lcd.fillRect(cx - 9, cy - 9, 6, 18, TFT_WHITE);
-  lcd.fillRect(cx + 3, cy - 9, 6, 18, TFT_WHITE);
-}
-
-void drawDock() {
-  lcd.fillRoundRect(8, DOCK_Y, SCR_W - 16, DOCK_H, 14, C(255, 255, 255));
-
-  lcd.fillRoundRect(VOL_MINUS_X0, VOL_Y, 30, 26, 8, C(116, 185, 255));
-  lcd.setTextColor(TFT_WHITE);
+void showBootError(const char* line1, const char* line2) {
+  lcd.fillRect(20, 90, 280, 60, TFT_BLACK);
+  lcd.setTextColor(TFT_RED);
   lcd.setTextSize(2);
-  lcd.drawString("-", VOL_MINUS_X0 + 8, VOL_Y + 4);
-
-  lcd.fillRoundRect(VOL_PLUS_X0, VOL_Y, 30, 26, 8, C(116, 185, 255));
-  lcd.drawString("+", VOL_PLUS_X0 + 8, VOL_Y + 4);
-
-  drawVolumeOnly();
-
-  drawIconPrev(BTN_PREV_CX, TRN_CY, C(108, 92, 231));
-  if (isPlaying) drawIconPause(BTN_PLAY_CX, TRN_CY, 0);
-  else drawIconPlay(BTN_PLAY_CX, TRN_CY, 0);
-  drawIconNext(BTN_NEXT_CX, TRN_CY, C(108, 92, 231));
-  dockDirty = false;
+  lcd.drawString(line1, 30, 95);
+  lcd.setTextSize(1);
+  lcd.drawString(line2, 30, 120);
 }
 
 void drawBackground() {
-  if (bgDrawn) return;
   for (int y = 0; y < SCR_H; y++) {
     uint8_t t = (y * 255) / (SCR_H - 1);
     uint8_t r = 108 - (t * 40 / 255);
@@ -489,98 +292,12 @@ void drawBackground() {
     uint8_t b = 231 - (t * 4 / 255);
     lcd.drawFastHLine(0, y, SCR_W, C(r, g, b));
   }
-  bgDrawn = true;
-}
-
-void drawStationPanel() {
-  lcd.fillRoundRect(10, 8, SCR_W - 20, 118, 16, C(255, 255, 255));
-  lcd.drawRoundRect(10, 8, SCR_W - 20, 118, 16, C(200, 210, 255));
-
-  drawStationTile();
-
-  lcd.setTextColor(C(108, 92, 231));
-  lcd.setTextSize(2);
-  lcd.drawString("TC RADIOS", 98, 12);
-
-  drawBatteryMeter(BAT_ICON_X, BAT_ICON_Y);
-
-  lcd.fillRoundRect(WIFI_BTN_X0, WIFI_BTN_Y0, WIFI_BTN_X1 - WIFI_BTN_X0, WIFI_BTN_Y1 - WIFI_BTN_Y0, 8, C(116, 185, 255));
-  lcd.setTextColor(TFT_WHITE);
-  lcd.setTextSize(1);
-  lcd.drawString("WiFi", WIFI_BTN_X0 + 12, WIFI_BTN_Y0 + 6);
-
-  if (totalStations > 0) {
-    lcd.fillRect(98, 32, 210, 52, C(255, 255, 255));
-    lcd.setTextColor(C(40, 40, 60));
-    lcd.setTextSize(2);
-    lcd.drawString(playlist[currentStationIdx].name, 100, 36);
-    lcd.setTextColor(C(253, 121, 168));
-    lcd.setTextSize(1);
-    lcd.drawString(playlist[currentStationIdx].genre, 100, 64);
-    char idx[12];
-    snprintf(idx, sizeof(idx), "%d/%d", currentStationIdx + 1, totalStations);
-    lcd.setTextColor(C(120, 120, 140));
-    lcd.drawString(idx, 100, 78);
-  }
-
-  stationDirty = false;
-}
-
-void drawLiveBadgeOnly() {
-  // LIVE indicator lives in the status strip now; keep for play/pause refresh hooks
-}
-
-void drawPlayButtonOnly() {
-  lcd.fillRect(BTN_PLAY_X0, TRN_ROW_Y0, BTN_PLAY_X1 - BTN_PLAY_X0, TRN_ROW_Y1 - TRN_ROW_Y0, C(255, 255, 255));
-  if (isPlaying) drawIconPause(BTN_PLAY_CX, TRN_CY, 0);
-  else drawIconPlay(BTN_PLAY_CX, TRN_CY, 0);
-}
-
-void drawVolumeOnly() {
-  int bx = 52, bw = 216, bh = 10;
-  lcd.fillRect(VOL_BAR_X0 - 2, VOL_Y + 5, VOL_BAR_X1 - VOL_BAR_X0 + 4, 16, C(255, 255, 255));
-  lcd.fillRoundRect(bx, VOL_Y + 7, bw, bh, 5, C(220, 225, 240));
-  int fill = (volumeLevel * bw) / 21;
-  if (fill > 0) lcd.fillRoundRect(bx, VOL_Y + 7, fill, bh, 5, C(108, 92, 231));
-}
-
-void updateStatusArea() {
-  lcd.fillRoundRect(18, 88, SCR_W - 36, 28, 10, C(245, 247, 255));
-  lcd.setTextSize(1);
-  if (streamPlaying && isPlaying) {
-    lcd.setTextColor(C(0, 184, 148));
-    lcd.drawString("ON AIR", 26, 98);
-    lcd.setTextColor(C(60, 60, 80));
-    lcd.drawString(streamTitle[0] ? streamTitle : statusLine, 72, 98);
-  } else if (userPaused) {
-    lcd.setTextColor(C(116, 185, 255));
-    lcd.drawString("PAUSED", 26, 98);
-    lcd.setTextColor(C(60, 60, 80));
-    lcd.drawString(streamTitle[0] ? streamTitle : statusLine, 72, 98);
-  } else {
-    lcd.setTextColor(C(253, 150, 68));
-    lcd.drawString("...", 26, 98);
-    lcd.setTextColor(C(100, 100, 120));
-    lcd.drawString(statusLine, 72, 98);
-  }
-  statusDirty = false;
 }
 
 void setStatus(const char* msg) {
   strncpy(statusLine, msg, sizeof(statusLine) - 1);
   statusLine[sizeof(statusLine) - 1] = '\0';
-  statusDirty = true;
-}
-
-void refreshPlaybackStatus() {
-  if (!audioReady) return;
-  if (audio.isRunning() && !streamPlaying) {
-    streamPlaying = true;
-    userPaused = false;
-    if (!streamTitle[0]) setStatus("Now Playing");
-    statusDirty = true;
-    drawLiveBadgeOnly();
-  }
+  chatDirty = true;
 }
 
 void initTouchController() {
@@ -610,8 +327,6 @@ bool readTouchScreen(int32_t &sx, int32_t &sy) {
 
   int16_t raw_x = ((d[0] & 0x0F) << 8) | d[1];
   int16_t raw_y = ((d[2] & 0x0F) << 8) | d[3];
-
-  // Portrait raw -> landscape (rotation 1). Mirror X to match on-screen left/right.
   sx = (SCR_W - 1) - raw_y;
   sy = raw_x;
   return (sx >= 0 && sx < SCR_W && sy >= 0 && sy < SCR_H);
@@ -644,7 +359,6 @@ int batteryVoltageToPercent(float volts) {
   static const float curveV[] = {4.10f, 4.05f, 3.98f, 3.92f, 3.87f, 3.82f, 3.79f, 3.77f, 3.74f, 3.68f, 3.40f};
   static const int curveP[] = {100, 90, 80, 70, 60, 50, 40, 30, 20, 10, 0};
   const int n = 11;
-
   if (volts >= curveV[0]) return 100;
   if (volts <= curveV[n - 1]) return 0;
   for (int i = 0; i < n - 1; i++) {
@@ -662,7 +376,6 @@ void updateBatteryMonitor() {
 
   float sample = readBatteryVoltage();
   batVoltage = (batVoltage <= 0.0f) ? sample : (batVoltage * 0.65f + sample * 0.35f);
-
   batHistory[batHistoryIdx] = batVoltage;
   batHistoryIdx = (batHistoryIdx + 1) % BAT_HISTORY;
   if (batHistoryCount < BAT_HISTORY) batHistoryCount++;
@@ -701,8 +414,6 @@ void drawBatteryMeter(int x, int y) {
   const int capW = 3;
   const int capH = 6;
 
-  lcd.fillRect(x - 1, y - 1, BAT_ICON_W + 2, BAT_ICON_H + 2, C(255, 255, 255));
-
   uint16_t frameCol = C(120, 120, 140);
   uint16_t fillCol = C(0, 184, 148);
   int pct = batPercent;
@@ -720,76 +431,10 @@ void drawBatteryMeter(int x, int y) {
 
   int innerW = bodyW - 4;
   int fillW = (pct * innerW) / 100;
-  if (fillW > 0) {
-    lcd.fillRoundRect(x + 2, y + 5, fillW, bodyH - 4, 2, fillCol);
-  }
-
-  if (batCharging && batAnimFrame) {
-    drawBatteryBolt(x + 12, y + 9, C(253, 221, 68));
-  }
-
+  if (fillW > 0) lcd.fillRoundRect(x + 2, y + 5, fillW, bodyH - 4, 2, fillCol);
+  if (batCharging && batAnimFrame) drawBatteryBolt(x + 12, y + 9, C(253, 221, 68));
   batDisplayPct = batPercent;
   batDirty = false;
-}
-
-void drawBatteryMeterOnly() {
-  drawBatteryMeter(BAT_ICON_X, BAT_ICON_Y);
-}
-
-void handleTouch(int32_t tx, int32_t ty) {
-  if (uiMode == UI_WIFI) {
-    handleWifiTouch(tx, ty);
-    return;
-  }
-  if (uiMode == UI_WIFI_PASS) {
-    handleWifiPassTouch(tx, ty);
-    return;
-  }
-
-  if (ty >= WIFI_BTN_Y0 && ty <= WIFI_BTN_Y1 && tx >= WIFI_BTN_X0 && tx <= WIFI_BTN_X1) {
-    openWifiTool();
-    return;
-  }
-
-  if (ty >= VOL_ROW_Y0 && ty <= VOL_ROW_Y1) {
-    if (tx >= VOL_MINUS_X0 && tx <= VOL_MINUS_X1) {
-      setVolumeLevel(volumeLevel - 1);
-      drawVolumeOnly();
-      return;
-    }
-    if (tx >= VOL_PLUS_X0 && tx <= VOL_PLUS_X1) {
-      setVolumeLevel(volumeLevel + 1);
-      drawVolumeOnly();
-      return;
-    }
-    if (tx >= VOL_BAR_X0 && tx <= VOL_BAR_X1) {
-      setVolumeLevel(((tx - VOL_BAR_X0) * 21) / (VOL_BAR_X1 - VOL_BAR_X0));
-      drawVolumeOnly();
-    }
-    return;
-  }
-
-  if (ty >= TRN_ROW_Y0 && ty <= TRN_ROW_Y1) {
-    if (tx >= BTN_PREV_X0 && tx <= BTN_PREV_X1) {
-      if (totalStations > 0) skipToPrevStation();
-      return;
-    }
-    if (tx >= BTN_PLAY_X0 && tx <= BTN_PLAY_X1) {
-      if (audioReady && !stationConnecting && audioLock(0)) {
-        isPlaying = !isPlaying;
-        userPaused = !isPlaying;
-        audio.pauseResume();
-        audioUnlock();
-        drawPlayButtonOnly();
-        statusDirty = true;
-        drawLiveBadgeOnly();
-      }
-      return;
-    }
-    if (tx >= BTN_NEXT_X0 && tx <= BTN_NEXT_X1) {
-      if (totalStations > 0) skipToNextStation();
-    }
-  }
 }
 
 void loadWifiCredentials() {
@@ -810,31 +455,21 @@ void saveWifiCredentials() {
   wifiPrefs.end();
 }
 
-void loadVolumeSetting() {
-  wifiPrefs.begin("audio", true);
-  int v = wifiPrefs.getInt("volume", volumeLevel);
+void loadApiKey() {
+  wifiPrefs.begin("ai", true);
+  String k = wifiPrefs.getString("groq", "");
   wifiPrefs.end();
-  if (v < 0) v = 0;
-  if (v > 21) v = 21;
-  volumeLevel = v;
+  strncpy(groqApiKey, k.c_str(), API_KEY_LEN - 1);
+  groqApiKey[API_KEY_LEN - 1] = '\0';
 }
 
-void saveVolumeSetting() {
-  wifiPrefs.begin("audio", false);
-  wifiPrefs.putInt("volume", volumeLevel);
+void saveApiKey() {
+  wifiPrefs.begin("ai", false);
+  wifiPrefs.putString("groq", groqApiKey);
   wifiPrefs.end();
 }
 
 void openWifiTool() {
-  if (audioReady) {
-    connectGen++;  // cancel in-flight station connect
-    if (audioLock(pdMS_TO_TICKS(50))) {
-      audio.stopSong();
-      audioUnlock();
-    }
-    streamPlaying = false;
-    isPlaying = false;
-  }
   uiMode = UI_WIFI;
   wifiDirty = true;
   wifiConnecting = false;
@@ -846,26 +481,149 @@ void openWifiTool() {
 }
 
 void closeWifiTool() {
-  uiMode = UI_RADIO;
-  bgDrawn = false;
-  stationDirty = true;
-  statusDirty = true;
-  dockDirty = true;
+  uiMode = UI_CHAT;
+  chatDirty = true;
   wifiDirty = false;
   wifiScanning = false;
   wifiConnecting = false;
-  if (WiFi.status() != WL_CONNECTED) return;
+  if (WiFi.status() == WL_CONNECTED) setStatus("Online — ask me anything");
+  else setStatus("Offline — connect WiFi");
+}
 
-  if (totalStations == 0) {
-    setStatus("Loading stations...");
-    loadPlaylistFromGitHub();
-    stationDirty = true;
+void openApiKeyTool() {
+  uiMode = UI_API_KEY;
+  strncpy(apiKeyDraft, groqApiKey, API_KEY_LEN - 1);
+  apiKeyDraft[API_KEY_LEN - 1] = '\0';
+  apiKbShift = false;
+  chatDirty = true;
+}
+
+void closeApiKeyTool() {
+  uiMode = UI_CHAT;
+  chatDirty = true;
+}
+
+void appendApiKeyChar(char c) {
+  size_t len = strlen(apiKeyDraft);
+  if (len >= API_KEY_LEN - 1) return;
+  apiKeyDraft[len] = c;
+  apiKeyDraft[len + 1] = '\0';
+  chatDirty = true;
+}
+
+void backspaceApiKey() {
+  size_t len = strlen(apiKeyDraft);
+  if (len == 0) return;
+  apiKeyDraft[len - 1] = '\0';
+  chatDirty = true;
+}
+
+void drawApiKeyScreen() {
+  drawBackground();
+  lcd.fillRoundRect(8, 6, SCR_W - 16, SCR_H - 12, 14, C(255, 255, 255));
+
+  lcd.setTextColor(C(108, 92, 231));
+  lcd.setTextSize(1);
+  lcd.drawString("Free Groq API key (console.groq.com)", 14, 10);
+  drawBatteryMeter(270, 8);
+
+  lcd.fillRoundRect(14, 28, 240, 26, 8, C(245, 247, 255));
+  lcd.setTextColor(C(40, 40, 60));
+  if (apiKeyDraft[0]) {
+    char shown[40];
+    size_t n = strlen(apiKeyDraft);
+    if (n <= 18) {
+      for (size_t i = 0; i < n && i < sizeof(shown) - 1; i++) shown[i] = '*';
+      shown[n] = '\0';
+    } else {
+      snprintf(shown, sizeof(shown), "********...%s", apiKeyDraft + n - 6);
+    }
+    lcd.drawString(shown, 22, 36);
+  } else {
+    lcd.setTextColor(C(150, 150, 170));
+    lcd.drawString("(optional — blank = free no-key AI)", 22, 36);
   }
-  if (!audioReady) initAudioHardware();
-  if (audioReady && totalStations > 0) {
-    isPlaying = true;
-    userPaused = false;
-    connectCurrentStation();
+
+  lcd.fillRoundRect(260, 28, 44, 26, 8, C(255, 118, 117));
+  lcd.setTextColor(TFT_WHITE);
+  lcd.drawString("Del", 272, 36);
+
+  const int keyW = 28;
+  const int keyH = 24;
+  int startY = 62;
+  for (int row = 0; row < 4; row++) {
+    const char* keys = apiKbShift ? wifiKbRowsShift[row] : wifiKbRows[row];
+    int len = strlen(keys);
+    int startX = (SCR_W - len * keyW) / 2;
+    for (int i = 0; i < len; i++) {
+      char label[2] = { keys[i], '\0' };
+      int x = startX + i * keyW;
+      int y = startY + row * (keyH + 4);
+      lcd.fillRoundRect(x, y, keyW - 2, keyH, 5, C(230, 235, 255));
+      lcd.setTextColor(C(40, 40, 60));
+      lcd.drawString(label, x + 9, y + 7);
+    }
+  }
+
+  lcd.fillRoundRect(14, 178, 56, 28, 8, C(116, 185, 255));
+  lcd.fillRoundRect(80, 178, 56, 28, 8, C(162, 155, 254));
+  lcd.fillRoundRect(146, 178, 70, 28, 8, C(200, 210, 255));
+  lcd.fillRoundRect(226, 178, 78, 28, 8, C(0, 184, 148));
+  lcd.setTextColor(TFT_WHITE);
+  lcd.drawString("Back", 28, 188);
+  lcd.drawString("Shift", 90, 188);
+  lcd.setTextColor(C(40, 40, 60));
+  lcd.drawString("Clear", 160, 188);
+  lcd.setTextColor(TFT_WHITE);
+  lcd.drawString("Save", 250, 188);
+}
+
+void handleApiKeyTouch(int32_t tx, int32_t ty) {
+  if (ty >= 28 && ty <= 54 && tx >= 260 && tx <= 304) {
+    backspaceApiKey();
+    return;
+  }
+
+  const int keyW = 28;
+  const int keyH = 24;
+  int startY = 62;
+  for (int row = 0; row < 4; row++) {
+    const char* keys = apiKbShift ? wifiKbRowsShift[row] : wifiKbRows[row];
+    int len = strlen(keys);
+    int startX = (SCR_W - len * keyW) / 2;
+    int y = startY + row * (keyH + 4);
+    if (ty < y || ty >= y + keyH) continue;
+    for (int i = 0; i < len; i++) {
+      int x = startX + i * keyW;
+      if (tx >= x && tx < x + keyW - 2) {
+        appendApiKeyChar(keys[i]);
+        return;
+      }
+    }
+  }
+
+  if (ty >= 178 && ty <= 206) {
+    if (tx >= 14 && tx <= 70) {
+      closeApiKeyTool();
+      return;
+    }
+    if (tx >= 80 && tx <= 136) {
+      apiKbShift = !apiKbShift;
+      chatDirty = true;
+      return;
+    }
+    if (tx >= 146 && tx <= 216) {
+      apiKeyDraft[0] = '\0';
+      chatDirty = true;
+      return;
+    }
+    if (tx >= 226 && tx <= 304) {
+      strncpy(groqApiKey, apiKeyDraft, API_KEY_LEN - 1);
+      groqApiKey[API_KEY_LEN - 1] = '\0';
+      saveApiKey();
+      setStatus(groqApiKey[0] ? "Groq key saved" : "Using free no-key AI");
+      closeApiKeyTool();
+    }
   }
 }
 
@@ -989,7 +747,6 @@ void drawWifiScreen() {
   lcd.setTextColor(C(108, 92, 231));
   lcd.setTextSize(2);
   lcd.drawString("WiFi", 130, 18);
-
   drawBatteryMeter(82, 16);
 
   lcd.fillRoundRect(246, 16, 56, 24, 8, C(0, 184, 148));
@@ -1000,11 +757,9 @@ void drawWifiScreen() {
   lcd.fillRect(18, 46, SCR_W - 36, 14, C(255, 255, 255));
   lcd.setTextColor(C(100, 100, 120));
   lcd.setTextSize(1);
-  if (wifiConnecting) {
-    lcd.drawString("Connecting...", 20, 46);
-  } else if (wifiScanning) {
-    lcd.drawString("Scanning...", 20, 46);
-  } else if (WiFi.status() == WL_CONNECTED) {
+  if (wifiConnecting) lcd.drawString("Connecting...", 20, 46);
+  else if (wifiScanning) lcd.drawString("Scanning...", 20, 46);
+  else if (WiFi.status() == WL_CONNECTED) {
     char cur[48];
     snprintf(cur, sizeof(cur), "Connected: %s", wifiSsid);
     lcd.drawString(cur, 20, 46);
@@ -1024,9 +779,7 @@ void drawWifiScreen() {
     if (idx < wifiNetCount) {
       lcd.setTextColor((idx == wifiSelected) ? C(108, 92, 231) : C(40, 40, 60));
       lcd.setTextSize(1);
-      char line[40];
-      snprintf(line, sizeof(line), "%s", wifiFoundSsid[idx]);
-      lcd.drawString(line, 26, y + 8);
+      lcd.drawString(wifiFoundSsid[idx], 26, y + 8);
       char meta[16];
       snprintf(meta, sizeof(meta), "%ddBm%s", (int)wifiFoundRssi[idx],
                wifiNeedsPassword(idx) ? " *" : "");
@@ -1057,7 +810,6 @@ void drawWifiScreen() {
     lcd.setTextSize(1);
     lcd.drawString("Connect failed — try again", 70, 210);
   }
-
   wifiDirty = false;
 }
 
@@ -1071,7 +823,6 @@ void drawWifiPassScreen() {
   snprintf(title, sizeof(title), "Password: %s",
            (wifiSelected >= 0 && wifiSelected < wifiNetCount) ? wifiFoundSsid[wifiSelected] : "");
   lcd.drawString(title, 16, 12);
-
   drawBatteryMeter(270, 8);
 
   lcd.fillRoundRect(14, 28, 240, 26, 8, C(245, 247, 255));
@@ -1114,21 +865,13 @@ void drawWifiPassScreen() {
   lcd.drawString("Space", 160, 188);
   lcd.setTextColor(TFT_WHITE);
   lcd.drawString(wifiConnecting ? "..." : "Join", 250, 188);
-
   wifiDirty = false;
 }
 
 void handleWifiTouch(int32_t tx, int32_t ty) {
   if (wifiConnecting) return;
-
-  if (ty >= 16 && ty <= 40 && tx >= 18 && tx <= 74) {
-    closeWifiTool();
-    return;
-  }
-  if (ty >= 16 && ty <= 40 && tx >= 246 && tx <= 302) {
-    startWifiScan();
-    return;
-  }
+  if (ty >= 16 && ty <= 40 && tx >= 18 && tx <= 74) { closeWifiTool(); return; }
+  if (ty >= 16 && ty <= 40 && tx >= 246 && tx <= 302) { startWifiScan(); return; }
 
   if (ty >= WIFI_LIST_Y0 && ty < WIFI_LIST_Y0 + WIFI_VISIBLE * WIFI_ROW_H) {
     int row = (ty - WIFI_LIST_Y0) / WIFI_ROW_H;
@@ -1149,10 +892,7 @@ void handleWifiTouch(int32_t tx, int32_t ty) {
       }
       return;
     }
-    if (tx >= 135 && tx <= 185) {
-      connectSelectedWifi();
-      return;
-    }
+    if (tx >= 135 && tx <= 185) { connectSelectedWifi(); return; }
     if (tx >= 230 && tx <= 280) {
       if (wifiSelected < wifiNetCount - 1) {
         wifiSelected++;
@@ -1165,11 +905,7 @@ void handleWifiTouch(int32_t tx, int32_t ty) {
 
 void handleWifiPassTouch(int32_t tx, int32_t ty) {
   if (wifiConnecting) return;
-
-  if (ty >= 28 && ty <= 54 && tx >= 260 && tx <= 304) {
-    backspaceWifiPass();
-    return;
-  }
+  if (ty >= 28 && ty <= 54 && tx >= 260 && tx <= 304) { backspaceWifiPass(); return; }
 
   const int keyW = 28;
   const int keyH = 24;
@@ -1190,32 +926,650 @@ void handleWifiPassTouch(int32_t tx, int32_t ty) {
   }
 
   if (ty >= 178 && ty <= 206) {
-    if (tx >= 14 && tx <= 70) {
-      uiMode = UI_WIFI;
-      wifiDirty = true;
-      return;
+    if (tx >= 14 && tx <= 70) { uiMode = UI_WIFI; wifiDirty = true; return; }
+    if (tx >= 80 && tx <= 136) { wifiKbShift = !wifiKbShift; wifiDirty = true; return; }
+    if (tx >= 146 && tx <= 216) { appendWifiPassChar(' '); return; }
+    if (tx >= 226 && tx <= 304) joinWifiWithPassword();
+  }
+}
+
+void wrapDrawText(const char* text, int x, int y, int maxW, int maxLines, uint16_t color) {
+  if (!text || !text[0] || maxLines <= 0) return;
+  lcd.setTextColor(color);
+  lcd.setTextSize(1);
+  char line[48];
+  int lineIdx = 0;
+  int linesDrawn = 0;
+  const char* p = text;
+  while (*p && linesDrawn < maxLines) {
+    lineIdx = 0;
+    line[0] = '\0';
+    while (*p == ' ') p++;
+    while (*p && *p != '\n') {
+      char trial[49];
+      memcpy(trial, line, lineIdx);
+      trial[lineIdx] = *p;
+      trial[lineIdx + 1] = '\0';
+      if (lcd.textWidth(trial) > maxW) break;
+      line[lineIdx++] = *p++;
+      line[lineIdx] = '\0';
+      if (lineIdx >= (int)sizeof(line) - 1) break;
     }
-    if (tx >= 80 && tx <= 136) {
-      wifiKbShift = !wifiKbShift;
-      wifiDirty = true;
-      return;
+    if (lineIdx == 0 && *p && *p != '\n') {
+      line[lineIdx++] = *p++;
+      line[lineIdx] = '\0';
     }
-    if (tx >= 146 && tx <= 216) {
-      appendWifiPassChar(' ');
-      return;
+    if (linesDrawn == maxLines - 1 && *p && *p != '\n') {
+      if (lineIdx > 3) {
+        line[lineIdx - 1] = '.';
+        line[lineIdx - 2] = '.';
+        line[lineIdx - 3] = '.';
+      }
+      while (*p && *p != '\n') p++;
     }
-    if (tx >= 226 && tx <= 304) {
-      joinWifiWithPassword();
+    lcd.drawString(line, x, y + linesDrawn * 12);
+    linesDrawn++;
+    if (*p == '\n') p++;
+  }
+}
+
+void addMessage(bool fromUser, const char* text) {
+  if (!text || !text[0]) return;
+  if (msgCount >= MAX_MSGS) {
+    for (int i = 1; i < MAX_MSGS; i++) messages[i - 1] = messages[i];
+    msgCount = MAX_MSGS - 1;
+  }
+  messages[msgCount].fromUser = fromUser;
+  strncpy(messages[msgCount].text, text, MSG_LEN - 1);
+  messages[msgCount].text[MSG_LEN - 1] = '\0';
+  msgCount++;
+  int visible = (uiMode == UI_COMPOSE) ? 3 : 5;
+  msgScroll = (msgCount > visible) ? (msgCount - visible) : 0;
+  chatDirty = true;
+}
+
+void appendDraftChar(char c) {
+  size_t len = strlen(draft);
+  if (len >= DRAFT_LEN - 1) return;
+  draft[len] = c;
+  draft[len + 1] = '\0';
+  chatDirty = true;
+}
+
+void backspaceDraft() {
+  size_t len = strlen(draft);
+  if (len == 0) return;
+  draft[len - 1] = '\0';
+  chatDirty = true;
+}
+
+void clearDraft() {
+  draft[0] = '\0';
+  chatDirty = true;
+}
+
+void urlEncode(const char* src, char* dest, size_t destLen) {
+  static const char* hex = "0123456789ABCDEF";
+  size_t o = 0;
+  for (size_t i = 0; src[i] && o + 4 < destLen; i++) {
+    unsigned char c = (unsigned char)src[i];
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+        (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+      dest[o++] = (char)c;
+    } else if (c == ' ') {
+      dest[o++] = '%'; dest[o++] = '2'; dest[o++] = '0';
+    } else {
+      dest[o++] = '%';
+      dest[o++] = hex[(c >> 4) & 0xF];
+      dest[o++] = hex[c & 0xF];
     }
   }
+  dest[o] = '\0';
+}
+
+void buildAiPrompt(char* out, size_t outLen) {
+  snprintf(out, outLen,
+           "You are TC Chat, a helpful free AI on a tiny ESP32 touchscreen. "
+           "Reply in plain text only. Keep answers under 45 words.\n");
+  // Include recent turns for light context (skip oldest if needed)
+  int start = 0;
+  if (msgCount > 4) start = msgCount - 4;
+  for (int i = start; i < msgCount; i++) {
+    size_t used = strlen(out);
+    if (used + 40 >= outLen) break;
+    snprintf(out + used, outLen - used, "%s: %s\n",
+             messages[i].fromUser ? "User" : "Assistant", messages[i].text);
+  }
+  size_t used = strlen(out);
+  if (used + 16 < outLen) strncat(out, "Assistant:", outLen - used - 1);
+}
+
+bool extractJsonContent(const char* json, char* dest, size_t destLen) {
+  dest[0] = '\0';
+  if (!json) return false;
+  const char* key = strstr(json, "\"content\"");
+  if (!key) return false;
+  key += 9;
+  while (*key == ' ' || *key == '\t' || *key == ':' ) key++;
+  if (*key != '"') return false;
+  key++;
+  size_t i = 0;
+  while (*key && *key != '"' && i < destLen - 1) {
+    if (*key == '\\' && key[1]) {
+      key++;
+      if (*key == 'n') dest[i++] = ' ';
+      else if (*key == 'r' || *key == 't') dest[i++] = ' ';
+      else dest[i++] = *key;
+      key++;
+      continue;
+    }
+    dest[i++] = *key++;
+  }
+  dest[i] = '\0';
+  return i > 0;
+}
+
+bool callGroqAi(const char* prompt, char* reply, size_t replyLen, char* err, size_t errLen) {
+  reply[0] = '\0';
+  err[0] = '\0';
+  if (!groqApiKey[0]) {
+    strncpy(err, "No Groq key", errLen - 1);
+    err[errLen - 1] = '\0';
+    return false;
+  }
+
+  // Escape prompt for JSON
+  String esc;
+  esc.reserve(strlen(prompt) + 16);
+  for (const char* p = prompt; *p; p++) {
+    char c = *p;
+    if (c == '\\' || c == '"') { esc += '\\'; esc += c; }
+    else if (c == '\n') esc += "\\n";
+    else if (c == '\r') continue;
+    else esc += c;
+  }
+
+  String body = String("{\"model\":\"") + GROQ_MODEL +
+                "\",\"temperature\":0.7,\"max_tokens\":120,\"messages\":["
+                "{\"role\":\"system\",\"content\":\"You are TC Chat on a tiny ESP32 screen. Plain text only. Under 45 words.\"},"
+                "{\"role\":\"user\",\"content\":\"" + esc + "\"}]}";
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(25000);
+  if (!http.begin(client, GROQ_URL)) {
+    strncpy(err, "Groq begin fail", errLen - 1);
+    err[errLen - 1] = '\0';
+    return false;
+  }
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Authorization", String("Bearer ") + groqApiKey);
+  int code = http.POST(body);
+  String resp = http.getString();
+  http.end();
+  if (code != HTTP_CODE_OK) {
+    snprintf(err, errLen, "Groq HTTP %d", code);
+    return false;
+  }
+  if (!extractJsonContent(resp.c_str(), reply, replyLen)) {
+    strncpy(err, "Groq parse fail", errLen - 1);
+    err[errLen - 1] = '\0';
+    return false;
+  }
+  for (char* p = reply; *p; p++) {
+    if (*p == '\r' || *p == '\n') *p = ' ';
+  }
+  return true;
+}
+
+bool callPollinationsAi(const char* prompt, char* reply, size_t replyLen, char* err, size_t errLen) {
+  reply[0] = '\0';
+  err[0] = '\0';
+
+  static char encoded[3600];
+  urlEncode(prompt, encoded, sizeof(encoded));
+  String url = String(AI_URL_BASE) + encoded;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(25000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  if (!http.begin(client, url)) {
+    strncpy(err, "HTTP begin fail", errLen - 1);
+    err[errLen - 1] = '\0';
+    return false;
+  }
+  http.addHeader("Accept", "text/plain");
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    snprintf(err, errLen, "HTTP %d", code);
+    http.end();
+    return false;
+  }
+  String body = http.getString();
+  http.end();
+  body.trim();
+  if (body.length() == 0) {
+    strncpy(err, "Empty reply", errLen - 1);
+    err[errLen - 1] = '\0';
+    return false;
+  }
+  if (body.startsWith("{") && body.indexOf("\"error\"") >= 0) {
+    strncpy(err, "Free API busy", errLen - 1);
+    err[errLen - 1] = '\0';
+    return false;
+  }
+  // Some gateways return OpenAI JSON even on the GET path.
+  if (body.indexOf("\"content\"") >= 0) {
+    if (extractJsonContent(body.c_str(), reply, replyLen)) {
+      for (char* p = reply; *p; p++) if (*p == '\r' || *p == '\n') *p = ' ';
+      return true;
+    }
+  }
+  strncpy(reply, body.c_str(), replyLen - 1);
+  reply[replyLen - 1] = '\0';
+  for (char* p = reply; *p; p++) {
+    if (*p == '\r' || *p == '\n') *p = ' ';
+  }
+  return true;
+}
+
+bool callFreeAi(const char* prompt, char* reply, size_t replyLen, char* err, size_t errLen) {
+  reply[0] = '\0';
+  err[0] = '\0';
+  if (WiFi.status() != WL_CONNECTED) {
+    strncpy(err, "No WiFi", errLen - 1);
+    err[errLen - 1] = '\0';
+    return false;
+  }
+
+  // Prefer free Groq key when configured (fast + reliable).
+  if (groqApiKey[0]) {
+    if (callGroqAi(prompt, reply, replyLen, err, errLen)) return true;
+  }
+
+  // Zero-key fallback.
+  char pollErr[64];
+  if (callPollinationsAi(prompt, reply, replyLen, pollErr, sizeof(pollErr))) return true;
+
+  if (groqApiKey[0]) {
+    // Keep Groq error if key was set but both failed.
+    if (!err[0]) {
+      strncpy(err, pollErr, errLen - 1);
+      err[errLen - 1] = '\0';
+    }
+  } else {
+    snprintf(err, errLen, "%s — tap Key for free Groq", pollErr);
+  }
+  return false;
+}
+
+void aiWorkerTask(void* param) {
+  (void)param;
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    char promptCopy[PROMPT_BUF];
+    if (aiMutex && xSemaphoreTake(aiMutex, portMAX_DELAY) == pdTRUE) {
+      strncpy(promptCopy, aiPendingPrompt, sizeof(promptCopy) - 1);
+      promptCopy[sizeof(promptCopy) - 1] = '\0';
+      xSemaphoreGive(aiMutex);
+    } else {
+      strncpy(promptCopy, aiPendingPrompt, sizeof(promptCopy) - 1);
+      promptCopy[sizeof(promptCopy) - 1] = '\0';
+    }
+
+    char reply[REPLY_BUF];
+    char err[64];
+    bool ok = callFreeAi(promptCopy, reply, sizeof(reply), err, sizeof(err));
+
+    if (aiMutex && xSemaphoreTake(aiMutex, portMAX_DELAY) == pdTRUE) {
+      if (ok) {
+        strncpy(aiReplyText, reply, sizeof(aiReplyText) - 1);
+        aiReplyText[sizeof(aiReplyText) - 1] = '\0';
+        aiErrorText[0] = '\0';
+      } else {
+        aiReplyText[0] = '\0';
+        strncpy(aiErrorText, err, sizeof(aiErrorText) - 1);
+        aiErrorText[sizeof(aiErrorText) - 1] = '\0';
+      }
+      aiReplyReady = true;
+      aiRequestPending = false;
+      xSemaphoreGive(aiMutex);
+    } else {
+      if (ok) {
+        strncpy(aiReplyText, reply, sizeof(aiReplyText) - 1);
+        aiReplyText[sizeof(aiReplyText) - 1] = '\0';
+        aiErrorText[0] = '\0';
+      } else {
+        aiReplyText[0] = '\0';
+        strncpy(aiErrorText, err, sizeof(aiErrorText) - 1);
+        aiErrorText[sizeof(aiErrorText) - 1] = '\0';
+      }
+      aiReplyReady = true;
+      aiRequestPending = false;
+    }
+  }
+}
+
+void startAiTask() {
+  if (!aiMutex) aiMutex = xSemaphoreCreateMutex();
+  if (!aiTaskHandle) {
+    xTaskCreatePinnedToCore(
+      aiWorkerTask,
+      "aiWorker",
+      16384,
+      nullptr,
+      1,
+      &aiTaskHandle,
+      0
+    );
+  }
+}
+
+void requestAiReply() {
+  if (aiBusy || aiRequestPending) return;
+  if (WiFi.status() != WL_CONNECTED) {
+    addMessage(false, "Connect WiFi first (tap WiFi).");
+    setStatus("Offline");
+    return;
+  }
+  buildAiPrompt(aiPendingPrompt, sizeof(aiPendingPrompt));
+  aiBusy = true;
+  aiRequestPending = true;
+  aiReplyReady = false;
+  setStatus("Thinking...");
+  if (aiTaskHandle) xTaskNotifyGive(aiTaskHandle);
+}
+
+void applyAiReply() {
+  if (!aiReplyReady) return;
+  char reply[REPLY_BUF];
+  char err[64];
+  if (aiMutex && xSemaphoreTake(aiMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    strncpy(reply, aiReplyText, sizeof(reply) - 1);
+    reply[sizeof(reply) - 1] = '\0';
+    strncpy(err, aiErrorText, sizeof(err) - 1);
+    err[sizeof(err) - 1] = '\0';
+    aiReplyReady = false;
+    xSemaphoreGive(aiMutex);
+  } else {
+    strncpy(reply, aiReplyText, sizeof(reply) - 1);
+    reply[sizeof(reply) - 1] = '\0';
+    strncpy(err, aiErrorText, sizeof(err) - 1);
+    err[sizeof(err) - 1] = '\0';
+    aiReplyReady = false;
+  }
+  aiBusy = false;
+  if (reply[0]) {
+    addMessage(false, reply);
+    setStatus("Online — ask me anything");
+  } else {
+    char msg[96];
+    snprintf(msg, sizeof(msg), "Sorry, AI failed (%s).", err[0] ? err : "error");
+    addMessage(false, msg);
+    setStatus("Tap to retry");
+  }
+}
+
+void sendDraftMessage() {
+  if (aiBusy) return;
+  // trim
+  size_t start = 0;
+  while (draft[start] == ' ') start++;
+  size_t end = strlen(draft);
+  while (end > start && draft[end - 1] == ' ') end--;
+  if (end <= start) return;
+  char text[DRAFT_LEN];
+  size_t n = end - start;
+  if (n >= sizeof(text)) n = sizeof(text) - 1;
+  memcpy(text, draft + start, n);
+  text[n] = '\0';
+  clearDraft();
+  uiMode = UI_CHAT;
+  addMessage(true, text);
+  requestAiReply();
+}
+
+void drawHeader() {
+  lcd.fillRoundRect(8, 4, SCR_W - 16, HEADER_H, 10, C(255, 255, 255));
+  lcd.setTextColor(C(108, 92, 231));
+  lcd.setTextSize(2);
+  lcd.drawString("TC CHAT", 48, 10);
+  drawBatteryMeter(BAT_ICON_X, BAT_ICON_Y);
+
+  lcd.fillRoundRect(196, 8, 44, 22, 8, groqApiKey[0] ? C(0, 184, 148) : C(162, 155, 254));
+  lcd.setTextColor(TFT_WHITE);
+  lcd.setTextSize(1);
+  lcd.drawString("Key", 208, 14);
+
+  lcd.fillRoundRect(248, 8, 56, 22, 8, C(116, 185, 255));
+  lcd.setTextColor(TFT_WHITE);
+  lcd.drawString("WiFi", 260, 14);
+
+  lcd.fillRect(8, HEADER_H + 2, SCR_W - 16, STATUS_H, C(245, 247, 255));
+  lcd.setTextColor(aiBusy ? C(253, 150, 68) : C(100, 100, 120));
+  lcd.setTextSize(1);
+  lcd.drawString(statusLine, 14, HEADER_H + 6);
+}
+
+void drawMessageArea() {
+  int y1 = (uiMode == UI_COMPOSE) ? MSG_AREA_Y1_KB : MSG_AREA_Y1_FULL;
+  int areaH = y1 - MSG_AREA_Y0;
+  lcd.fillRoundRect(8, MSG_AREA_Y0, SCR_W - 16, areaH, 10, C(255, 255, 255));
+
+  if (msgCount == 0) {
+    lcd.setTextColor(C(140, 140, 160));
+    lcd.setTextSize(1);
+    lcd.drawString("Tap the bar below to type.", 24, MSG_AREA_Y0 + 28);
+    lcd.drawString("Free AI — Key optional (Groq).", 24, MSG_AREA_Y0 + 44);
+    return;
+  }
+
+  int visible = (uiMode == UI_COMPOSE) ? 3 : 5;
+  int bubbleH = (areaH - 8) / visible;
+  int start = msgScroll;
+  if (start < 0) start = 0;
+  if (start > msgCount - 1) start = msgCount - 1;
+
+  for (int i = 0; i < visible; i++) {
+    int idx = start + i;
+    if (idx >= msgCount) break;
+    int y = MSG_AREA_Y0 + 4 + i * bubbleH;
+    bool user = messages[idx].fromUser;
+    int bx = user ? 70 : 14;
+    int bw = SCR_W - 28 - 56;
+    uint16_t bg = user ? C(108, 92, 231) : C(245, 247, 255);
+    uint16_t fg = user ? TFT_WHITE : C(40, 40, 60);
+    lcd.fillRoundRect(bx, y, bw, bubbleH - 4, 8, bg);
+    lcd.setTextColor(user ? C(200, 210, 255) : C(0, 184, 148));
+    lcd.setTextSize(1);
+    lcd.drawString(user ? "You" : "AI", bx + 6, y + 3);
+    wrapDrawText(messages[idx].text, bx + 6, y + 15, bw - 12, 2, fg);
+  }
+
+  // Scroll hints
+  if (msgScroll > 0) {
+    lcd.setTextColor(C(108, 92, 231));
+    lcd.drawString("^", SCR_W - 22, MSG_AREA_Y0 + 6);
+  }
+  if (msgScroll + visible < msgCount) {
+    lcd.setTextColor(C(108, 92, 231));
+    lcd.drawString("v", SCR_W - 22, y1 - 14);
+  }
+}
+
+void drawInputBar(bool composing) {
+  int y = composing ? INPUT_Y_KB : INPUT_Y_FULL;
+  lcd.fillRoundRect(8, y, 220, INPUT_H, 10, C(255, 255, 255));
+  lcd.setTextColor(draft[0] ? C(40, 40, 60) : C(150, 150, 170));
+  lcd.setTextSize(1);
+  const char* shown = draft[0] ? draft : (composing ? "Type a message..." : "Tap to type...");
+  // Show only the tail if draft is long
+  char clip[40];
+  if (strlen(shown) > 34) {
+    snprintf(clip, sizeof(clip), "...%s", shown + strlen(shown) - 31);
+    lcd.drawString(clip, 16, y + 10);
+  } else {
+    lcd.drawString(shown, 16, y + 10);
+  }
+
+  uint16_t sendCol = (aiBusy || !draft[0]) ? C(180, 185, 200) : C(0, 184, 148);
+  lcd.fillRoundRect(236, y, 76, INPUT_H, 10, sendCol);
+  lcd.setTextColor(TFT_WHITE);
+  lcd.drawString(aiBusy ? "..." : "Send", 256, y + 10);
+}
+
+void drawComposeKeyboard() {
+  const int keyW = 28;
+  const int keyH = 22;
+  int startY = KB_Y0;
+  for (int row = 0; row < 4; row++) {
+    const char* keys = kbShift ? wifiKbRowsShift[row] : wifiKbRows[row];
+    int len = strlen(keys);
+    int startX = (SCR_W - len * keyW) / 2;
+    for (int i = 0; i < len; i++) {
+      char label[2] = { keys[i], '\0' };
+      int x = startX + i * keyW;
+      int y = startY + row * (keyH + 3);
+      lcd.fillRoundRect(x, y, keyW - 2, keyH, 5, C(255, 255, 255));
+      lcd.setTextColor(C(40, 40, 60));
+      lcd.setTextSize(1);
+      lcd.drawString(label, x + 9, y + 6);
+    }
+  }
+
+  lcd.fillRoundRect(8, 220, 50, 18, 6, C(116, 185, 255));
+  lcd.fillRoundRect(64, 220, 50, 18, 6, C(162, 155, 254));
+  lcd.fillRoundRect(120, 220, 70, 18, 6, C(255, 255, 255));
+  lcd.fillRoundRect(196, 220, 50, 18, 6, C(255, 118, 117));
+  lcd.fillRoundRect(252, 220, 60, 18, 6, C(0, 184, 148));
+  lcd.setTextColor(TFT_WHITE);
+  lcd.setTextSize(1);
+  lcd.drawString("Hide", 20, 225);
+  lcd.drawString("Shift", 74, 225);
+  lcd.setTextColor(C(40, 40, 60));
+  lcd.drawString("Space", 140, 225);
+  lcd.setTextColor(TFT_WHITE);
+  lcd.drawString("Del", 210, 225);
+  lcd.drawString("Send", 266, 225);
+}
+
+void drawChatScreen() {
+  drawBackground();
+  drawHeader();
+  drawMessageArea();
+  drawInputBar(uiMode == UI_COMPOSE);
+  if (uiMode == UI_COMPOSE) drawComposeKeyboard();
+  chatDirty = false;
+}
+
+void handleComposeTouch(int32_t tx, int32_t ty) {
+  if (ty >= 8 && ty <= 30 && tx >= 248 && tx <= 304) {
+    openWifiTool();
+    return;
+  }
+  if (ty >= 8 && ty <= 30 && tx >= 196 && tx <= 240) {
+    openApiKeyTool();
+    return;
+  }
+
+  // Message scroll while composing
+  if (ty >= MSG_AREA_Y0 && ty < MSG_AREA_Y1_KB) {
+    int mid = (MSG_AREA_Y0 + MSG_AREA_Y1_KB) / 2;
+    int visible = 3;
+    if (ty < mid && msgScroll > 0) {
+      msgScroll--;
+      chatDirty = true;
+    } else if (ty >= mid && msgScroll + visible < msgCount) {
+      msgScroll++;
+      chatDirty = true;
+    }
+    return;
+  }
+
+  // Send on input bar
+  int iy = INPUT_Y_KB;
+  if (ty >= iy && ty <= iy + INPUT_H && tx >= 236 && tx <= 312) {
+    sendDraftMessage();
+    return;
+  }
+
+  const int keyW = 28;
+  const int keyH = 22;
+  int startY = KB_Y0;
+  for (int row = 0; row < 4; row++) {
+    const char* keys = kbShift ? wifiKbRowsShift[row] : wifiKbRows[row];
+    int len = strlen(keys);
+    int startX = (SCR_W - len * keyW) / 2;
+    int y = startY + row * (keyH + 3);
+    if (ty < y || ty >= y + keyH) continue;
+    for (int i = 0; i < len; i++) {
+      int x = startX + i * keyW;
+      if (tx >= x && tx < x + keyW - 2) {
+        if (!aiBusy) appendDraftChar(keys[i]);
+        return;
+      }
+    }
+  }
+
+  if (ty >= 220 && ty <= 238) {
+    if (tx >= 8 && tx <= 58) { uiMode = UI_CHAT; chatDirty = true; return; }
+    if (tx >= 64 && tx <= 114) { kbShift = !kbShift; chatDirty = true; return; }
+    if (tx >= 120 && tx <= 190) { if (!aiBusy) appendDraftChar(' '); return; }
+    if (tx >= 196 && tx <= 246) { if (!aiBusy) backspaceDraft(); return; }
+    if (tx >= 252 && tx <= 312) { sendDraftMessage(); return; }
+  }
+}
+
+void handleChatTouch(int32_t tx, int32_t ty) {
+  if (ty >= 8 && ty <= 30 && tx >= 248 && tx <= 304) {
+    openWifiTool();
+    return;
+  }
+  if (ty >= 8 && ty <= 30 && tx >= 196 && tx <= 240) {
+    openApiKeyTool();
+    return;
+  }
+
+  // Scroll history
+  if (ty >= MSG_AREA_Y0 && ty < MSG_AREA_Y1_FULL) {
+    int mid = (MSG_AREA_Y0 + MSG_AREA_Y1_FULL) / 2;
+    int visible = 5;
+    if (ty < mid && msgScroll > 0) {
+      msgScroll--;
+      chatDirty = true;
+    } else if (ty >= mid && msgScroll + visible < msgCount) {
+      msgScroll++;
+      chatDirty = true;
+    }
+    return;
+  }
+
+  int iy = INPUT_Y_FULL;
+  if (ty >= iy && ty <= iy + INPUT_H) {
+    if (tx >= 236 && tx <= 312) {
+      sendDraftMessage();
+      return;
+    }
+    uiMode = UI_COMPOSE;
+    chatDirty = true;
+  }
+}
+
+void handleTouch(int32_t tx, int32_t ty) {
+  if (uiMode == UI_WIFI) { handleWifiTouch(tx, ty); return; }
+  if (uiMode == UI_WIFI_PASS) { handleWifiPassTouch(tx, ty); return; }
+  if (uiMode == UI_API_KEY) { handleApiKeyTouch(tx, ty); return; }
+  if (uiMode == UI_COMPOSE) { handleComposeTouch(tx, ty); return; }
+  handleChatTouch(tx, ty);
 }
 
 void setup() {
   Serial.begin(115200);
   delay(300);
 
-  pinMode(I2S_AMP_EN, OUTPUT);
-  digitalWrite(I2S_AMP_EN, HIGH);
   pinMode(45, OUTPUT);
   digitalWrite(45, HIGH);
 
@@ -1225,12 +1579,10 @@ void setup() {
   initTouchController();
   showSplashScreen();
   initBatteryMonitor();
-
-  fsReady = LittleFS.begin(true);
-  if (fsReady) loadPlaylistFromCache();
-
   loadWifiCredentials();
-  loadVolumeSetting();
+  loadApiKey();
+  startAiTask();
+
   splashStartMs = millis();
   wifiStartMs = millis();
   WiFi.mode(WIFI_STA);
@@ -1240,30 +1592,21 @@ void setup() {
     showBootError("PSRAM not found", "Tools: OPI PSRAM ON");
     return;
   }
+
+  addMessage(false, "Hi! Free on-device AI. Tap below to chat. Optional: Key for Groq.");
 }
 
 void loop() {
   switch (bootState) {
     case BOOT_SPLASH:
-      if (WiFi.status() == WL_CONNECTED) {
-        WiFi.setSleep(false);
-        if (totalStations == 0 && !playlistLoadStarted) {
-          playlistLoadStarted = true;
-          loadPlaylistFromGitHub();
-        } else if (totalStations > 0) {
-          playlistRefreshPending = true;
-        }
-      }
       if (millis() - splashStartMs >= SPLASH_MS) {
-        bgDrawn = false;
-        stationDirty = true;
-        statusDirty = true;
-        dockDirty = true;
-        if (totalStations > 0) {
-          setStatus(WiFi.status() == WL_CONNECTED ? "Ready" : "Waiting WiFi...");
-          bootState = (WiFi.status() == WL_CONNECTED) ? BOOT_AUDIO : BOOT_WIFI;
+        chatDirty = true;
+        if (WiFi.status() == WL_CONNECTED) {
+          WiFi.setSleep(false);
+          setStatus("Online — ask me anything");
+          bootState = BOOT_DONE;
         } else {
-          setStatus("Loading stations...");
+          setStatus("Connecting WiFi...");
           bootState = BOOT_WIFI;
         }
       }
@@ -1272,44 +1615,19 @@ void loop() {
     case BOOT_WIFI:
       if (WiFi.status() == WL_CONNECTED) {
         WiFi.setSleep(false);
-        if (totalStations == 0) {
-          bootState = BOOT_PLAYLIST;
-        } else {
-          bootState = BOOT_AUDIO;
-        }
+        setStatus("Online — ask me anything");
+        bootState = BOOT_DONE;
+        chatDirty = true;
       } else if (millis() - wifiStartMs > WIFI_TIMEOUT_MS) {
-        setStatus(totalStations > 0 ? "Offline (cached)" : "WiFi failed");
-        if (totalStations > 0) {
-          bootState = BOOT_AUDIO;
-        } else {
-          bootState = BOOT_DONE;
-          openWifiTool();
-        }
+        setStatus("WiFi failed — tap WiFi");
+        bootState = BOOT_DONE;
+        openWifiTool();
       }
-      break;
-
-    case BOOT_PLAYLIST:
-      if (!playlistLoadStarted) {
-        playlistLoadStarted = true;
-        loadPlaylistFromGitHub();
-        setStatus(totalStations > 0 ? "Ready" : "No stations");
-        stationDirty = true;
-        statusDirty = true;
-        dockDirty = true;
-        bootState = BOOT_AUDIO;
-      }
-      break;
-
-    case BOOT_AUDIO:
-      initAudioHardware();
-      if (totalStations > 0) connectCurrentStation();
-      bootState = BOOT_DONE;
       break;
 
     default: break;
   }
 
-  // Touch + UI first so controls stay live while streams connect in the background.
   static bool touchDown = false;
   int32_t touchX, touchY;
   bool touching = (bootState == BOOT_DONE) && readTouchScreen(touchX, touchY);
@@ -1326,207 +1644,22 @@ void loop() {
     batDirty = true;
   }
   if (batDirty) {
-    if (uiMode == UI_RADIO && bootState == BOOT_DONE && !stationDirty) {
-      drawBatteryMeterOnly();
-    } else if (uiMode != UI_RADIO) {
-      wifiDirty = true;
-    } else if (bootState == BOOT_DONE) {
-      stationDirty = true;
-    }
+    if (uiMode == UI_WIFI || uiMode == UI_WIFI_PASS) wifiDirty = true;
+    else chatDirty = true;
   }
 
   pollWifiScan();
   pollWifiConnect();
+  applyAiReply();
 
-  if (bootState == BOOT_DONE && playlistRefreshPending && WiFi.status() == WL_CONNECTED) {
-    playlistRefreshPending = false;
-    int prevIdx = currentStationIdx;
-    if (loadPlaylistFromGitHub()) {
-      if (currentStationIdx >= totalStations) currentStationIdx = 0;
-      stationDirty = true;
-      if (prevIdx != currentStationIdx && audioReady) connectCurrentStation();
-    }
-  }
-
-  if (uiMode != UI_RADIO) {
+  if (uiMode == UI_WIFI || uiMode == UI_WIFI_PASS) {
     if (wifiDirty) {
-      bgDrawn = false;
       if (uiMode == UI_WIFI_PASS) drawWifiPassScreen();
       else drawWifiScreen();
     }
-  } else {
-    if (bootState == BOOT_DONE && audioReady && !userPaused && !stationConnecting &&
-        !streamPlaying && !audio.isRunning() &&
-        streamConnectMs > 0 && (millis() - streamConnectMs > STREAM_SKIP_MS)) {
-      setStatus("Skipping...");
-      skipToNextStation();
-    }
-
-    if (stationDirty) {
-      drawBackground();
-      drawStationPanel();
-      statusDirty = true;
-    }
-    if (statusDirty) updateStatusArea();
-    if (dockDirty) drawDock();
-  }
-
-  if (audioReady && audioLock(0)) {
-    audio.loop();
-    refreshPlaybackStatus();
-    audioUnlock();
-  }
-}
-
-void showBootError(const char* line1, const char* line2) {
-  lcd.fillRect(20, 90, 280, 60, TFT_BLACK);
-  lcd.setTextColor(TFT_RED);
-  lcd.setTextSize(2);
-  lcd.drawString(line1, 30, 95);
-  lcd.setTextSize(1);
-  lcd.drawString(line2, 30, 120);
-}
-
-void initAudioHardware() {
-  if (audioReady) return;
-  pinMode(I2S_AMP_EN, OUTPUT);
-  digitalWrite(I2S_AMP_EN, LOW);
-  Wire.begin(I2C_SDA, I2C_SCL);
-  Wire.setClock(400000);
-  delay(30);
-  if (!initES8311Codec()) { setStatus("Codec error"); return; }
-  audio.setPinout(I2S_BCLK, I2S_LRCK, I2S_DOUT, I2S_MCLK);
-  audio.setVolume(volumeLevel);
-  uint8_t reg = (volumeLevel == 0) ? 0 : (uint8_t)((volumeLevel * 255) / 21);
-  es8311Write(0x32, reg);
-  audio.setConnectionTimeout(2500, 3000);
-  audioReady = true;
-  startStationConnectTask();
-}
-
-bool audioLock(TickType_t ticks) {
-  if (!audioMutex) return true;
-  return xSemaphoreTake(audioMutex, ticks) == pdTRUE;
-}
-
-void audioUnlock() {
-  if (audioMutex) xSemaphoreGive(audioMutex);
-}
-
-void stationConnectTask(void* param) {
-  (void)param;
-  for (;;) {
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-    if (!audioReady || totalStations <= 0) continue;
-
-    while (true) {
-      int gen = connectGen;
-      int idx = currentStationIdx;
-      if (idx < 0 || idx >= totalStations) break;
-
-      char urlCopy[URL_LEN];
-      strncpy(urlCopy, playlist[idx].url, URL_LEN - 1);
-      urlCopy[URL_LEN - 1] = '\0';
-
-      stationConnecting = true;
-      if (audioLock(portMAX_DELAY)) {
-        audio.stopSong();
-        if (gen == connectGen && idx == currentStationIdx) {
-          audio.connecttohost(urlCopy);
-        }
-        audioUnlock();
-      }
-      stationConnecting = false;
-
-      // User changed station while we were connecting — try the new one.
-      if (gen != connectGen || idx != currentStationIdx) {
-        streamConnectMs = millis();
-        setStatus("Connecting...");
-        stationDirty = true;
-        statusDirty = true;
-        continue;
-      }
-      break;
-    }
-  }
-}
-
-void startStationConnectTask() {
-  if (!audioMutex) audioMutex = xSemaphoreCreateMutex();
-  if (!stationTaskHandle) {
-    xTaskCreatePinnedToCore(
-      stationConnectTask,
-      "stationConnect",
-      8192,
-      nullptr,
-      1,
-      &stationTaskHandle,
-      0
-    );
-  }
-}
-
-void skipToNextStation() {
-  if (totalStations <= 0) return;
-  currentStationIdx = (currentStationIdx + 1) % totalStations;
-  connectCurrentStation();
-}
-
-void skipToPrevStation() {
-  if (totalStations <= 0) return;
-  currentStationIdx = (currentStationIdx - 1 + totalStations) % totalStations;
-  connectCurrentStation();
-}
-
-bool loadPlaylistFromGitHub() {
-  HTTPClient http;
-  http.setTimeout(8000);
-  http.begin(jsonUrl);
-  if (http.GET() != HTTP_CODE_OK) { http.end(); return false; }
-
-  String payload = http.getString();
-  http.end();
-  if (!parsePlaylistJson(payload.c_str())) return false;
-  savePlaylistCache(payload);
-  return true;
-}
-
-void connectCurrentStation() {
-  if (!audioReady || totalStations <= 0) return;
-  userPaused = false;
-  isPlaying = true;
-  streamPlaying = false;
-  streamTitle[0] = '\0';
-  streamConnectMs = millis();
-  setStatus("Connecting...");
-  stationDirty = true;
-  statusDirty = true;
-  dockDirty = true;
-  connectGen++;
-  if (stationTaskHandle) xTaskNotifyGive(stationTaskHandle);
-}
-
-void audio_showstreamtitle(const char *info) {
-  if (!info || !info[0]) return;
-  strncpy(streamTitle, info, sizeof(streamTitle) - 1);
-  streamTitle[sizeof(streamTitle) - 1] = '\0';
-  streamPlaying = true;
-  statusDirty = true;
-}
-
-void audio_info(const char *info) {
-  Serial.printf("Audio: %s\n", info);
-  if (!info) return;
-  String msg(info);
-  if (msg.indexOf("bitrate") >= 0 || msg.indexOf("PLAY") >= 0 ||
-      msg.indexOf("Connected") >= 0 || msg.indexOf("MP3") >= 0 || msg.indexOf("AAC") >= 0) {
-    streamPlaying = true;
-    setStatus("Now Playing");
-  } else if (msg.indexOf("failed") >= 0 || msg.indexOf("404") >= 0 || msg.indexOf("timeout") >= 0) {
-    setStatus("Stream error");
-    if (millis() - lastAutoSkipMs > 3000) {
-      lastAutoSkipMs = millis();
-      skipToNextStation();
-    }
+  } else if (uiMode == UI_API_KEY) {
+    if (chatDirty) drawApiKeyScreen();
+  } else if (bootState == BOOT_DONE && chatDirty) {
+    drawChatScreen();
   }
 }
